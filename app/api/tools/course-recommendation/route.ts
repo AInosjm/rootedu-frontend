@@ -2,15 +2,37 @@ import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import { getRedisClient } from '../../../../lib/redis';
 import { ChromaClient } from 'chromadb';
+import { DefaultEmbeddingFunction } from '@chroma-core/default-embed';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ChromaDB 클라이언트만 사용 (LangChain 의존성 제거)
+// ChromaDB 클라이언트와 기본 임베딩 함수 초기화
 const chromaClient = new ChromaClient({
   path: process.env.CHROMA_URL || 'http://localhost:8000'
 });
+
+const embeddingFunction = new DefaultEmbeddingFunction();
+
+// 코사인 유사도 계산 함수
+function calculateCosineSimilarity(vecA: number[], vecB: number[]): number {
+  if (vecA.length !== vecB.length) return 0;
+  
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  
+  if (normA === 0 || normB === 0) return 0;
+  
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -46,6 +68,7 @@ export async function POST(request: NextRequest) {
         allInfluencers.push(influencer);
       }
     }
+
     let relevantInfluencers: any[] = [];
     
     try {
@@ -59,62 +82,144 @@ export async function POST(request: NextRequest) {
         } as any);
         console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 접근 성공`);
       } catch {
-        // 컬렉션이 없으면 생성 (ChromaDB 기본 임베딩 함수 사용)
+        // 컬렉션이 없으면 생성 (기본 임베딩 함수 사용)
         collection = await chromaClient.createCollection({
-          name: collectionName
+          name: collectionName,
+          embeddingFunction: embeddingFunction
         } as any);
-        console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 생성 성공`);
+        console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 생성 성공 (기본 임베딩)`);
       }
       
-      // ChromaDB의 기본 임베딩 함수를 사용하여 텍스트를 벡터로 변환
-      // 또는 간단한 키워드 기반 검색으로 대체
-      const searchTerms = message.toLowerCase().split(' ');
-      
-      // 키워드 기반 유사도 검색 (ChromaDB 없이도 작동)
-      relevantInfluencers = allInfluencers.filter(inf => {
-        const searchableText = [
-          inf.name,
-          inf.username,
-          inf.bio,
-          inf.description,
-          ...inf.tags
-        ].join(' ').toLowerCase();
+      // 벡터 기반 의미적 검색 (RAG)
+      try {
+        console.log('🔍 벡터 기반 유사도 검색 시작...');
         
-        // 검색어와 매칭되는 정도 계산
-        const matchScore = searchTerms.reduce((score: number, term: string) => {
-          if (searchableText.includes(term)) {
-            score += 1;
-            // 태그 매칭은 더 높은 점수
-            if (inf.tags.some((tag: string) => tag.toLowerCase().includes(term))) {
-              score += 2;
-            }
+        // 검색 쿼리를 벡터로 변환
+        const queryEmbedding = await embeddingFunction.generate(message as any);
+        console.log('✅ 검색 쿼리 벡터화 완료');
+        
+        // 모든 인플루언서의 텍스트를 벡터로 변환
+        console.log('🔄 인플루언서 텍스트 벡터화 중...');
+        const influencerEmbeddings = await Promise.all(
+          allInfluencers.map(async (inf, index) => {
+            const searchableText = [
+              inf.name,
+              inf.username,
+              inf.bio,
+              inf.description,
+              ...inf.tags
+            ].join(' ');
+            
+            const embedding = await embeddingFunction.generate(searchableText as any);
+            console.log(`✅ ${inf.name} 벡터화 완료 (${index + 1}/${allInfluencers.length})`);
+            
+            return { influencer: inf, embedding };
+          })
+        );
+        
+        // 코사인 유사도 점수 계산
+        console.log('📊 유사도 점수 계산 중...');
+        
+        // 디버깅: 벡터 정보 확인
+        console.log('🔍 디버깅: 쿼리 벡터 타입:', typeof queryEmbedding);
+        console.log('🔍 디버깅: 쿼리 벡터 길이:', Array.isArray(queryEmbedding) ? queryEmbedding.length : 'N/A');
+        
+        const scoredInfluencers = influencerEmbeddings.map(({ influencer, embedding }, index) => {
+          // 벡터 타입 처리 및 차원 정규화 (안전한 타입 변환)
+          let queryVector = queryEmbedding as unknown as number[];
+          let embeddingVector = embedding as unknown as number[];
+          
+          // 2차원 배열인 경우 첫 번째 요소 사용
+          if (Array.isArray(queryVector[0])) {
+            queryVector = queryVector[0] as unknown as number[];
           }
-          return score;
-        }, 0);
+          if (Array.isArray(embeddingVector[0])) {
+            embeddingVector = embeddingVector[0] as unknown as number[];
+          }
+          
+          // 벡터 길이 맞추기 (짧은 쪽에 맞춤)
+          const minLength = Math.min(queryVector.length, embeddingVector.length);
+          const normalizedQuery = queryVector.slice(0, minLength);
+          const normalizedEmbedding = embeddingVector.slice(0, minLength);
+          
+          const similarity = calculateCosineSimilarity(normalizedQuery, normalizedEmbedding);
+          
+          // 디버깅: 첫 번째 몇 개의 유사도 점수 확인
+          if (index < 3) {
+            console.log(`🔍 ${influencer.name} 유사도 점수:`, similarity);
+            console.log(`🔍 ${influencer.name} 벡터 차원:`, normalizedEmbedding.length);
+          }
+          
+          // NaN 체크 및 기본값 설정
+          const validSimilarity = isNaN(similarity) ? 0.1 : Math.max(similarity, 0.1);
+          
+          return { ...influencer, similarityScore: validSimilarity };
+        });
         
-        return matchScore > 0;
-      });
-      
-      // 관련성 점수로 정렬
-      relevantInfluencers.sort((a, b) => {
-        const aScore = searchTerms.reduce((score: number, term: string) => {
-          const searchableText = [a.name, a.bio, a.description, ...a.tags].join(' ').toLowerCase();
-          if (searchableText.includes(term)) score += 1;
-          if (a.tags.some((tag: string) => tag.toLowerCase().includes(term))) score += 2;
-          return score;
-        }, 0);
+        // 유사도 점수로 정렬 (높은 점수 순)
+        scoredInfluencers.sort((a, b) => b.similarityScore - a.similarityScore);
         
-        const bScore = searchTerms.reduce((score: number, term: string) => {
-          const searchableText = [b.name, b.bio, b.description, ...b.tags].join(' ').toLowerCase();
-          if (searchableText.includes(term)) score += 1;
-          if (b.tags.some((tag: string) => tag.toLowerCase().includes(term))) score += 2;
-          return score;
-        }, 0);
+        // 모든 인플루언서 포함 (필터링 제거)
+        relevantInfluencers = scoredInfluencers.map(inf => {
+          if(inf.similarityScore > 0) {
+            const { similarityScore, ...influencer } = inf;
+            return influencer;
+          }
+        });
         
-        return bScore - aScore;
-      });
-      
-      console.log('✅ 키워드 기반 검색 성공:', relevantInfluencers.length, '개 결과');
+        console.log('✅ 벡터 기반 검색 성공:', relevantInfluencers.length, '개 결과');
+        console.log('📈 최고 유사도 점수:', scoredInfluencers[0]?.similarityScore?.toFixed(4));
+        console.log('📉 최저 유사도 점수:', scoredInfluencers[scoredInfluencers.length - 1]?.similarityScore?.toFixed(4));
+        
+      } catch (vectorError) {
+        console.log('⚠️ 벡터 검색 실패, 키워드 기반 검색으로 대체:', vectorError);
+        
+        // 키워드 기반 검색으로 폴백
+        const searchTerms = message.toLowerCase().split(' ');
+        
+        relevantInfluencers = allInfluencers.filter(inf => {
+          const searchableText = [
+            inf.name,
+            inf.username,
+            inf.bio,
+            inf.description,
+            ...inf.tags
+          ].join(' ').toLowerCase();
+          
+          const matchScore = searchTerms.reduce((score: number, term: string) => {
+            if (searchableText.includes(term)) {
+              score += 1;
+              if (inf.tags.some((tag: string) => tag.toLowerCase().includes(term))) {
+                score += 2;
+              }
+            }
+            return score;
+          }, 0);
+          
+          return matchScore > 0;
+        });
+        
+        // 관련성 점수로 정렬
+        relevantInfluencers.sort((a, b) => {
+          const aScore = searchTerms.reduce((score: number, term: string) => {
+            const searchableText = [a.name, a.bio, a.description, ...a.tags].join(' ').toLowerCase();
+            if (searchableText.includes(term)) score += 1;
+            if (a.tags.some((tag: string) => tag.toLowerCase().includes(term))) score += 2;
+            return score;
+          }, 0);
+          
+          const bScore = searchTerms.reduce((score: number, term: string) => {
+            const searchableText = [b.name, b.bio, b.description, ...b.tags].join(' ').toLowerCase();
+            if (searchableText.includes(term)) score += 1;
+            if (b.tags.some((tag: string) => tag.toLowerCase().includes(term))) score += 2;
+            return score;
+          }, 0);
+          
+          return bScore - aScore;
+        });
+        
+        console.log('✅ 키워드 기반 검색 성공:', relevantInfluencers.length, '개 결과');
+      }
       
     } catch (searchError) {
       console.error('❌ 검색 중 오류 발생:', searchError);
@@ -122,7 +227,6 @@ export async function POST(request: NextRequest) {
       relevantInfluencers = allInfluencers;
     }
 
-    // RAG에서 이미 정렬된 결과를 사용 (추가 점수 계산 불필요)
     // 상위 5개 인플루언서 선택
     const topInfluencers = relevantInfluencers.slice(0, 5);
 
@@ -141,7 +245,7 @@ export async function POST(request: NextRequest) {
     const messages = [
       {
         role: 'system' as const,
-        content: `당신은 RootEdu 강좌 추천 전문 AI 어시스턴트입니다. 키워드 기반 검색을 통해 찾은 실제 인플루언서 데이터를 기반으로 학생들에게 최적의 강좌를 추천해야 합니다.
+        content: `당신은 RootEdu 강좌 추천 전문 AI 어시스턴트입니다. 벡터 기반 의미적 검색과 키워드 검색을 통해 찾은 실제 인플루언서 데이터를 기반으로 학생들에게 최적의 강좌를 추천해야 합니다.
 
 현재 RootEdu에 등록된 인플루언서 정보:
 ${context}
