@@ -30,12 +30,28 @@ async function setupVectorDB() {
     console.log(`📊 총 ${influencerSlugs.length}명의 인플루언서 데이터 발견`);
     
     // ChromaDB 및 OpenAI 임베딩 초기화
-    const { OpenAIEmbeddings } = require('@langchain/openai');
     const { ChromaClient } = require('chromadb');
+    const OpenAI = require('openai');
     
-    const embeddings = new OpenAIEmbeddings({
-      openAIApiKey: process.env.OPENAI_API_KEY,
+    // OpenAI 클라이언트 초기화
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
     });
+    
+    // OpenAI Embedding 함수
+    async function generateEmbedding(text: string) {
+      try {
+        const response = await openai.embeddings.create({
+          model: 'text-embedding-3-small',
+          input: text,
+        });
+        
+        return response.data[0].embedding;
+      } catch (error) {
+        console.error('OpenAI Embedding 오류:', error);
+        throw error;
+      }
+    }
     
     // ChromaDB 클라이언트 초기화 (로컬 또는 원격)
     const chromaClient = new ChromaClient({
@@ -52,13 +68,11 @@ async function setupVectorDB() {
       });
       console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 접근 성공`);
     } catch {
-      // 컬렉션이 없으면 생성 (OpenAI 임베딩 함수 명시)
+      // 컬렉션이 없으면 생성
       collection = await chromaClient.createCollection({
-        name: collectionName,
-        embeddingFunction: embeddings,
-        metadata: { "hnsw:space": "cosine" }
+        name: collectionName
       });
-      console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 생성 성공 (OpenAI 임베딩)`);
+      console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 생성 성공`);
     }
     
     // 기존 데이터 삭제 (선택사항)
@@ -86,8 +100,8 @@ async function setupVectorDB() {
           data.tags ? JSON.parse(data.tags).join(' ') : ''
         ].join(' ');
         
-        // 텍스트를 벡터로 변환
-        const embedding = await embeddings.embedQuery(searchableText);
+        // OpenAI로 텍스트를 벡터로 변환
+        const embedding = await generateEmbedding(searchableText);
         
         vectors.push(embedding);
         metadatas.push({
@@ -126,10 +140,10 @@ async function setupVectorDB() {
 // 스크립트 실행
 if (require.main === module) {
   setupVectorDB().then(() => {
-    console.log('🏁 ChromaDB 설정 스크립트 완료');
+    console.log('ChromaDB 설정 스크립트 완료');
     process.exit(0);
   }).catch((error) => {
-    console.error('💥 스크립트 실행 실패:', error);
+    console.error('스크립트 실행 실패:', error);
     process.exit(1);
   });
 }
