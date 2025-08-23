@@ -1,252 +1,165 @@
-import { NextRequest, NextResponse } from 'next/server';
-import OpenAI from 'openai';
-import { getRedisClient } from '../../../../lib/redis';
-import { ChromaClient } from 'chromadb';
+'use client';
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+import { useState } from 'react';
+import Card from '../../../components/ui/Card';
+import Button from '../../../components/ui/Button';
+import AIChat from '../../../components/ui/AIChat';
+import { ArrowLeft } from 'lucide-react';
+import Link from 'next/link';
 
-// ChromaDB 클라이언트 초기화
-const chromaClient = new ChromaClient({
-  path: process.env.CHROMA_URL || 'http://localhost:8000'
-});
+export default function CourseRecommendationPage() {
+  type ChatMessage = {
+    id: string;
+    role: 'user' | 'ai';
+    content: string;
+    timestamp: Date;
+  };
 
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      id: 'ai-welcome',
+      role: 'ai',
+      content: `안녕하세요! 강좌 추천 AI 어시스턴트입니다. 🎯
 
+RootEdu의 인플루언서 강좌 중에서 당신에게 가장 적합한 강좌를 추천해드립니다.
 
-export async function POST(request: NextRequest) {
-  try {
-    const { message, history } = await request.json();
+**🎯 강좌 선택 가이드**
 
-    if (!message) {
-      return NextResponse.json(
-        { error: '메시지가 필요합니다.' },
-        { status: 400 }
-      );
-    }
+다음 질문들을 통해 최적의 강좌를 찾아보세요:
 
-    // Redis에서 인플루언서 데이터 검색
-    const redis = await getRedisClient();
-    const influencerSlugs = await redis.sMembers('influencers');
-    let allInfluencers: any[] = [];
+1. **현재 실력 수준은?** (초급/중급/고급)
+2. **목표하는 성취 수준은?** (기초 다지기/실력 향상/고득점)
+3. **선호하는 학습 방식은?** (이론 중심/실전 문제/토론형)
+4. **가능한 학습 시간은?** (하루 30분/1시간/2시간 이상)
+5. **특별히 보완하고 싶은 부분은?** (개념 이해/문제 풀이/시험 전략)
 
-    // 모든 인플루언서 데이터 수집
-    for (const slug of influencerSlugs) {
-      const data = await redis.hGetAll(`influencer:${slug}`);
-      if (data && data.name) {
-        const influencer = {
-          id: data.id,
-          slug: data.slug,
-          name: data.name,
-          username: data.Instagram || data.username || '',
-          avatar: data.avatar,
-          bio: data.bio,
-          description: data.description,
-          tags: data.tags ? JSON.parse(data.tags) : [],
-          stats: data.stats ? JSON.parse(data.stats) : {}
-        };
-        allInfluencers.push(influencer);
-      }
-    }
+**📚 추천 가능한 과목 분야:**
+- 수학 (기초/고급 수학, 미적분, 확률통계)
+- 과학 (물리, 화학, 생명과학)
+- 언어 (국어, 영어, 논술)
+- 사회 (역사, 지리, 정치경제)
+- 예체능 (음악, 미술, 체육)
 
-    let relevantInfluencers: any[] = [];
+어떤 과목이나 학습 목표에 대해 도움이 필요하신가요?`,
+      timestamp: new Date(),
+    },
+  ]);
+
+  const handleSendMessage = async (message: string) => {
+    const now = Date.now();
     
+    // 사용자 메시지 추가
+    const userMessage: ChatMessage = {
+      id: `user-${now}`,
+      role: 'user',
+      content: message,
+      timestamp: new Date(),
+    };
+
+    setChatMessages(prev => [...prev, userMessage]);
+
     try {
-      // ChromaDB 컬렉션 접근
-      const collectionName = 'rootedu-influencers';
-      let collection;
-      
-      try {
-        collection = await chromaClient.getCollection({
-          name: collectionName
-        } as any);
-        console.log(`✅ ChromaDB 컬렉션 '${collectionName}' 접근 성공`);
-      } catch (error) {
-        console.error('❌ ChromaDB 컬렉션 접근 실패:', error);
-        throw error;
+      // OpenAI API 호출
+      const response = await fetch('/api/tools/course-recommendation', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: message,
+          history: chatMessages.map(msg => ({
+            role: msg.role,
+            content: msg.content
+          }))
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const aiMessage: ChatMessage = {
+          id: `ai-${now + 1}`,
+          role: 'ai',
+          content: data.response,
+          timestamp: new Date(),
+        };
+        setChatMessages(prev => [...prev, aiMessage]);
+      } else {
+        throw new Error('API 호출 실패');
       }
-      
-      // ChromaDB 벡터 검색 (이미 저장된 임베딩 사용)
-      try {
-        console.log('🔍 ChromaDB 벡터 검색 시작...');
-        
-        // 검색 쿼리를 벡터로 변환
-        const queryEmbedding = await openai.embeddings.create({
-          model: 'text-embedding-3-small',
-          input: message,
-        });
-        const queryVector = queryEmbedding.data[0].embedding;
-        console.log('✅ 검색 쿼리 벡터화 완료');
-        
-        // ChromaDB에서 벡터 검색 (이미 저장된 임베딩과 비교)
-        const searchResults = await collection.query({
-          queryEmbeddings: [queryVector],
-          nResults: 10
-        } as any);
-        
-        
-        console.log('✅ ChromaDB 벡터 검색 완료');
-        
-        // 검색 결과를 인플루언서 데이터와 매칭
-        if (searchResults.ids && searchResults.ids[0]) {
-          const resultIds = searchResults.ids[0];
-          const resultDistances = searchResults.distances?.[0] || [];
-          
-          // 거리를 유사도 점수로 변환 (거리가 작을수록 유사도 높음)
-          const scoredInfluencers = resultIds.map((id: string, index: number) => {
-            const influencer = allInfluencers.find(inf => inf.id === id);
-            if (influencer) {
-              const distance = resultDistances[index] || 0;
-              const similarityScore = Math.max(0, 1 - distance); // 거리를 유사도로 변환
-              return { ...influencer, similarityScore };
-            }
-            return null;
-          }).filter(Boolean);
-          
-          // 유사도 점수로 정렬 (높은 점수 순)
-          scoredInfluencers.sort((a, b) => b.similarityScore - a.similarityScore);
-          
-          // 모든 인플루언서 포함
-          relevantInfluencers = scoredInfluencers.map(inf => {
-            const { similarityScore, ...influencer } = inf;
-            return influencer;
-          });
-          
-          console.log('✅ ChromaDB 벡터 검색 성공:', relevantInfluencers.length, '개 결과');
-          console.log('📈 최고 유사도 점수:', scoredInfluencers[0]?.similarityScore?.toFixed(4));
-          console.log('📉 최저 유사도 점수:', scoredInfluencers[scoredInfluencers.length - 1]?.similarityScore?.toFixed(4));
-        } else {
-          throw new Error('벡터 검색 결과가 없습니다');
-        }
-        
-      } catch (vectorError) {
-        console.log('⚠️ ChromaDB 벡터 검색 실패, 키워드 기반 검색으로 대체:', vectorError);
-        
-        // 키워드 기반 검색으로 폴백
-        const searchTerms = message.toLowerCase().split(' ');
-        
-        relevantInfluencers = allInfluencers.filter(inf => {
-          const searchableText = [
-            inf.name,
-            inf.username,
-            inf.bio,
-            inf.description,
-            ...inf.tags
-          ].join(' ').toLowerCase();
-          
-          const matchScore = searchTerms.reduce((score: number, term: string) => {
-            if (searchableText.includes(term)) {
-              score += 1;
-              if (inf.tags.some((tag: string) => tag.toLowerCase().includes(term))) {
-                score += 2;
-              }
-            }
-            return score;
-          }, 0);
-          
-          return matchScore > 0;
-        });
-        
-        // 관련성 점수로 정렬
-        relevantInfluencers.sort((a, b) => {
-          const aScore = searchTerms.reduce((score: number, term: string) => {
-            const searchableText = [a.name, a.bio, a.description, ...a.tags].join(' ').toLowerCase();
-            if (searchableText.includes(term)) score += 1;
-            if (a.tags.some((tag: string) => tag.toLowerCase().includes(term))) score += 2;
-            return score;
-          }, 0);
-          
-          const bScore = searchTerms.reduce((score: number, term: string) => {
-            const searchableText = [b.name, b.bio, b.description, ...b.tags].join(' ').toLowerCase();
-            if (searchableText.includes(term)) score += 1;
-            if (b.tags.some((tag: string) => tag.toLowerCase().includes(term))) score += 2;
-            return score;
-          }, 0);
-          
-          return bScore - aScore;
-        });
-        
-        console.log('✅ 키워드 기반 검색 성공:', relevantInfluencers.length, '개 결과');
-      }
-      
-    } catch (searchError) {
-      console.error('❌ 검색 중 오류 발생:', searchError);
-      // 검색 실패 시 모든 인플루언서를 반환
-      relevantInfluencers = allInfluencers;
+    } catch (error) {
+      const errorMessage: ChatMessage = {
+        id: `ai-error-${now + 1}`,
+        role: 'ai',
+        content: '죄송합니다. 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요.',
+        timestamp: new Date(),
+      };
+      setChatMessages(prev => [...prev, errorMessage]);
     }
+  };
 
-    // 상위 5개 인플루언서 선택
-    const topInfluencers = relevantInfluencers.slice(0, 5);
+  return (
+    <div className="min-h-screen bg-[var(--color-bg-primary)]">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Header */}
+        <div className="mb-8">
+          <Link 
+            href="/tools" 
+            className="inline-flex items-center text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] mb-4"
+          >
+            <ArrowLeft className="w-4 h-4 mr-2" />
+            도구 목록으로 돌아가기
+          </Link>
+          <h1 className="text-3xl font-semibold text-[var(--color-text-primary)] mb-2">
+            🎯 강좌 추천 AI 어시스턴트
+          </h1>
+          <p className="text-[var(--color-text-secondary)]">
+            AI가 당신에게 맞는 최적의 인플루언서 강좌를 추천합니다
+          </p>
+        </div>
 
-    // RAG를 위한 컨텍스트 구성
-    const context = topInfluencers.map(inf => `
-인플루언서: ${inf.name} (@${inf.username})
-소개: ${inf.bio}
-상세 설명: ${inf.description}
-전문 분야: ${inf.tags.join(', ')}
-팔로워: ${inf.stats.followers?.toLocaleString() || 0}명
-무료 강좌: ${inf.stats.free_courses || 0}개
-유료 강좌: ${inf.stats.paid_courses || 0}개
-`).join('\n\n');
+        {/* Chat Interface */}
+        <Card className="p-6">
+          <AIChat
+            messages={chatMessages}
+            onSendMessage={handleSendMessage}
+            placeholder="학습 목표나 선호사항을 알려주세요..."
+            className="h-[600px]"
+          />
+        </Card>
 
-    // 대화 히스토리 구성 - OpenAI API 형식에 맞게 role 변환
-    const messages = [
-      {
-        role: 'system' as const,
-        content: `당신은 RootEdu 강좌 추천 전문 AI 어시스턴트입니다. ChromaDB 벡터 기반 의미적 검색과 키워드 검색을 통해 찾은 실제 인플루언서 데이터를 기반으로 학생들에게 최적의 강좌를 추천해야 합니다.
-
-현재 RootEdu에 등록된 인플루언서 정보:
-${context}
-
-추천 기준:
-- 현재 실력 수준 (초급/중급/고급)
-- 목표 성취 수준 (기초/실력향상/고득점/특별활동)
-- 선호하는 학습 방식 (이론중심/실전문제/토론형/프로젝트형)
-- 가능한 학습 시간 (30분/1시간/2시간 이상)
-- 특별히 보완하고 싶은 부분 (개념이해/문제풀이/시험전략/실습)
-
-응답 스타일:
-- 친근하고 격려적인 톤 사용
-- 실제 존재하는 인플루언서만 추천
-- 각 인플루언서의 특징과 장점을 구체적으로 설명
-- 학생의 동기부여와 성공 가능성 강조
-- 이모지를 활용한 가독성 있는 응답
-- 한국어로 응답
-
-주의사항:
-- 위에 제공된 인플루언서 데이터만 사용하여 추천
-- 존재하지 않는 인플루언서는 언급하지 않음
-- 학생의 수준과 목표에 맞는 구체적인 추천
-- 학습 동기와 지속성을 고려한 추천
-
-항상 학생의 성공과 만족을 최우선으로 하여 최적의 인플루언서를 추천하세요.`
-      },
-      ...history.map((msg: any) => ({
-        role: msg.role === 'ai' ? 'assistant' : msg.role,
-        content: msg.content
-      })),
-      {
-        role: 'user' as const,
-        content: message
-      }
-    ];
-
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4',
-      messages,
-      max_tokens: 1500,
-      temperature: 0.7,
-    });
-
-    const response = completion.choices[0]?.message?.content || '죄송합니다. 응답을 생성할 수 없습니다.';
-
-    return NextResponse.json({ response });
-
-  } catch (error) {
-    console.error('OpenAI API 오류:', error);
-    return NextResponse.json(
-      { error: 'AI 응답 생성 중 오류가 발생했습니다.' },
-      { status: 500 }
-    );
-  }
+        {/* Recommendation Tips */}
+        <div className="mt-8">
+          <h3 className="text-lg font-semibold text-[var(--color-text-primary)] mb-4">
+            💡 효과적인 강좌 선택을 위한 팁
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Card className="p-4">
+              <h4 className="font-medium text-[var(--color-text-primary)] mb-2">🎯 목표 명확화</h4>
+              <p className="text-sm text-[var(--color-text-tertiary)]">
+                "수학을 잘하고 싶다"보다는 "수학 모의고사 80점 이상"처럼 구체적으로
+              </p>
+            </Card>
+            <Card className="p-4">
+              <h4 className="font-medium text-[var(--color-text-primary)] mb-2">⏰ 시간 계획</h4>
+              <p className="text-sm text-[var(--color-text-tertiary)]">
+                하루에 투자할 수 있는 시간을 정확히 파악하고 강좌 난이도에 맞추기
+              </p>
+            </Card>
+            <Card className="p-4">
+              <h4 className="font-medium text-[var(--color-text-primary)] mb-2">📊 학습 스타일</h4>
+              <p className="text-sm text-[var(--color-text-tertiary)]">
+                이론 중심 vs 실전 중심, 혼자 vs 그룹 등 선호하는 학습 방식을 고려하기
+              </p>
+            </Card>
+            <Card className="p-4">
+              <h4 className="font-medium text-[var(--color-text-primary)] mb-2">🔄 단계별 접근</h4>
+              <p className="text-sm text-[var(--color-text-tertiary)]">
+                기초부터 차근차근, 또는 현재 수준에서 한 단계 업그레이드하는 방향으로
+              </p>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
