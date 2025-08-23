@@ -11,6 +11,7 @@
     "setup-vector-db": "npx tsx scripts/setup-vector-db.ts"
   },
   "dependencies": {
+    "@chroma-core/default-embed": "^0.1.8",
     "@playwright/test": "^1.54.2",
     "@types/bcryptjs": "^2.4.6",
     "bcryptjs": "^3.0.2",
